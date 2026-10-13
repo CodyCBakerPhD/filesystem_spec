@@ -78,6 +78,45 @@ def test_block_cache_lru_no_redundant_reads():
     assert cache.cache_info().misses == 3
 
 
+def test_block_cache_coalesces_missing_blocks():
+    # The blocks missing for a read are fetched with one request per run of
+    # consecutive missing blocks
+    content = bytes(range(256)) * 40
+    requests = []
+
+    def fetcher(start, end):
+        requests.append((start, end))
+        return content[start:end]
+
+    cache = BlockCache(100, fetcher, len(content), maxblocks=5)
+    assert cache._fetch(150, 420) == content[150:420]
+    assert requests == [(100, 500)]
+    # Cached blocks are not fetched again
+    assert cache._fetch(30, 720) == content[30:720]
+    assert requests[1:] == [(0, 100), (500, 800)]
+    assert cache.cache_info().misses == 8
+    assert cache.miss_count == 8
+    assert cache.total_requested_bytes == 800
+    # Reads at the end of the content, and beyond
+    assert cache._fetch(10_190, 20_000) == content[10_190:]
+    assert requests[3:] == [(10_100, 10_240)]
+    assert cache._fetch(20_000, 20_100) == b""
+    # A read of more than maxblocks blocks is fetched once
+    requests.clear()
+    assert cache._fetch(0, len(content)) == content
+    assert len(requests) <= 3
+    assert sum(end - start for start, end in requests) < len(content)
+    assert cache.cache_info().currsize == 5
+
+
+def test_block_cache_pickle_coalesces():
+    cache = BlockCache(4, letters_fetcher, len(string.ascii_letters), maxblocks=4)
+    assert cache._fetch(1, 9) == b"bcdefghi"
+    cache2 = pickle.loads(pickle.dumps(cache))
+    assert cache2._fetch(1, 9) == b"bcdefghi"
+    assert cache2.cache_info().misses == 3
+
+
 def test_background_block_cache_no_redundant_reads():
     block_size = 4
     maxblocks = 2

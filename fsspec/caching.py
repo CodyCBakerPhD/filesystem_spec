@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import collections
-import functools
 import logging
 import math
 import os
@@ -451,17 +450,18 @@ class BlockCache(BaseCache):
     """
     Cache holding memory as a set of blocks.
 
-    Requests are only ever made ``blocksize`` at a time, and are
+    Data are requested in whole blocks of ``blocksize`` bytes, which are
     stored in an LRU cache. The least recently accessed block is
-    discarded when more than ``maxblocks`` are stored.
+    discarded when more than ``maxblocks`` are stored. The blocks missing
+    for a read that spans several blocks are requested together: one
+    request per run of consecutive missing blocks.
 
     Parameters
     ----------
     blocksize : int
         The number of bytes to store in each block.
-        Requests are only ever made for ``blocksize``, so this
-        should balance the overhead of making a request against
-        the granularity of the blocks.
+        Requests are made for whole blocks, so this should balance the
+        overhead of making a request against the granularity of the blocks.
     fetcher : Callable
     size : int
         The total size of the file being cached.
@@ -478,7 +478,7 @@ class BlockCache(BaseCache):
         super().__init__(blocksize, fetcher, size)
         self.nblocks = math.ceil(size / blocksize)
         self.maxblocks = maxblocks
-        self._fetch_block_cached = functools.lru_cache(maxblocks)(self._fetch_block)
+        self._fetch_block_cached = UpdatableLRU(self._fetch_block, maxblocks)
 
     def cache_info(self):
         """
@@ -498,9 +498,7 @@ class BlockCache(BaseCache):
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
-        self._fetch_block_cached = functools.lru_cache(state["maxblocks"])(
-            self._fetch_block
-        )
+        self._fetch_block_cached = UpdatableLRU(self._fetch_block, state["maxblocks"])
 
     def _fetch(self, start: int | None, end: int | None) -> bytes:
         if start is None:
@@ -513,6 +511,25 @@ class BlockCache(BaseCache):
         return self._read_cache(
             start, end, start // self.blocksize, (end - 1) // self.blocksize
         )
+
+    def _fetch_blocks(self, first: int, last: int) -> list[bytes]:
+        """
+        Fetch the blocks from `first` to `last` (inclusive) with one request,
+        and add them to the cache.
+        """
+        start = first * self.blocksize
+        end = min((last + 1) * self.blocksize, self.size)
+        nblocks = last - first + 1
+        self.total_requested_bytes += nblocks * self.blocksize
+        self.miss_count += nblocks
+        logger.info("BlockCache fetching blocks %d-%d", first, last)
+        data = super()._fetch(start, end)
+        blocks = [
+            data[i * self.blocksize : (i + 1) * self.blocksize] for i in range(nblocks)
+        ]
+        for number, block in zip(range(first, last + 1), blocks):
+            self._fetch_block_cached.add_key(block, number, miss=True)
+        return blocks
 
     def _fetch_block(self, block_number: int) -> bytes:
         """
@@ -551,28 +568,37 @@ class BlockCache(BaseCache):
             end_pos = self.blocksize
 
         self.hit_count += 1
-        if start_block_number == end_block_number:
-            block: bytes = self._fetch_block_cached(start_block_number)
-            return block[start_pos:end_pos]
-
-        else:
-            # read from the initial
-            out = [self._fetch_block_cached(start_block_number)[start_pos:]]
-
-            # intermediate blocks
-            # Note: it'd be nice to combine these into one big request. However
-            # that doesn't play nicely with our LRU cache.
-            out.extend(
-                map(
-                    self._fetch_block_cached,
-                    range(start_block_number + 1, end_block_number),
+        numbers = range(start_block_number, end_block_number + 1)
+        # Fetch each run of consecutive missing blocks with one request.  The
+        # blocks fetched are used directly (rather than read back from the
+        # cache), as a read spanning more than ``maxblocks`` blocks evicts
+        # some of them before they are used.
+        blocks: dict[int, bytes] = {}
+        missing = []
+        for n in numbers:
+            if self._fetch_block_cached.is_key_cached(n):
+                # Read now, before fetching missing blocks may evict it
+                blocks[n] = self._fetch_block_cached(n)
+            else:
+                missing.append(n)
+        i = 0
+        while i < len(missing):
+            j = i
+            while j + 1 < len(missing) and missing[j + 1] == missing[j] + 1:
+                j += 1
+            blocks.update(
+                zip(
+                    range(missing[i], missing[j] + 1),
+                    self._fetch_blocks(missing[i], missing[j]),
                 )
             )
-
-            # final block
-            out.append(self._fetch_block_cached(end_block_number)[:end_pos])
-
-            return b"".join(out)
+            i = j + 1
+        out = [blocks[n] for n in numbers]
+        if len(out) == 1:
+            return out[0][start_pos:end_pos]
+        out[0] = out[0][start_pos:]
+        out[-1] = out[-1][:end_pos]
+        return b"".join(out)
 
 
 class BytesCache(BaseCache):
@@ -863,9 +889,15 @@ class UpdatableLRU(Generic[P, T]):
         with self._lock:
             return args in self._cache
 
-    def add_key(self, result: T, *args: Any) -> None:
+    def add_key(self, result: T, *args: Any, miss: bool = False) -> None:
+        """
+        Cache `result` as the result for `args` (counted as a cache miss if
+        `miss`, i.e. if it was computed because it was not cached)
+        """
         with self._lock:
             self._cache[args] = result
+            if miss:
+                self._misses += 1
             if len(self._cache) > self._max_size:
                 self._cache.popitem(last=False)
 
